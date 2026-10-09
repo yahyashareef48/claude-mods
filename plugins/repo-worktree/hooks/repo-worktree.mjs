@@ -148,7 +148,23 @@ async function loadWorktree($, wt) {
     git($, wt.path, ["diff", "--numstat", "HEAD"]),
   ]);
   if (!status.ok) return { ...wt, error: status.err || "git status failed" };
-  return { ...wt, ...parseStatus(status.out), ...parseNumstat(numstat.out) };
+  const loaded = { ...wt, ...parseStatus(status.out), ...parseNumstat(numstat.out) };
+  return loaded.branch ? loaded : { ...loaded, ...(await detachedFrom($, wt.path)) };
+}
+
+// A detached worktree checked out from a ref (`git checkout origin/main`):
+// that ref, read from HEAD's reflog, and how far HEAD is behind or ahead of it.
+async function detachedFrom($, path) {
+  const log = await git($, path, ["reflog", "-1", "--format=%gs"]);
+  const ref = log.out.trim().match(/ to (\S+)$/)?.[1];
+  if (!ref || /^[0-9a-f]{7,40}$/i.test(ref)) return {};
+  const ok = await git($, path, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+  if (!ok.ok) return {};
+  const [behind, ahead] = await Promise.all([
+    git($, path, ["rev-list", "--count", `HEAD..${ref}`]),
+    git($, path, ["rev-list", "--count", `${ref}..HEAD`]),
+  ]);
+  return { detachedFrom: ref, behind: Number(behind.out.trim()) || 0, ahead: Number(ahead.out.trim()) || 0 };
 }
 
 async function loadRepo($, root) {
@@ -361,13 +377,18 @@ async function push($, wt) {
 
 async function act($, root, wt, kind) {
   if (state.busy[wt.path]) return;
-  if (!wt.branch) { say($, wt.path, "Detached HEAD: check out a branch first", true); return; }
+  if (!wt.branch && kind !== "advance") { say($, wt.path, "Detached HEAD: check out a branch first", true); return; }
   state.busy[wt.path] = kind;
   delete state.messages[wt.path];
   $.ui.invalidate("ui.render");
   try {
     let r;
-    if (kind === "pull") {
+    if (kind === "advance") {
+      // A detached worktree moves to the latest of the ref it came from.
+      await fetchRepo($, root);
+      r = await git($, wt.path, ["checkout", "--detach", wt.detachedFrom], 60_000);
+      say($, wt.path, r.ok ? `At the latest ${wt.detachedFrom}` : `Couldn't move: ${lastLine(r)}`, !r.ok);
+    } else if (kind === "pull") {
       r = await git($, wt.path, ["pull", "--ff-only"], 120_000);
       say($, wt.path, r.ok ? "Pulled" : `Pull stopped: ${lastLine(r)}`, !r.ok);
     } else if (kind === "push") {
@@ -420,10 +441,9 @@ async function pressRepo($, root) {
 // one action that fits. Details (changed files, errors) wait to be asked for.
 
 const GREEN = "#34c759", AMBER = "#ff9f0a", RED = "#ff453a", GRAY = "#8e8e93";
-const STATUS_ALT = { [GREEN]: "Up to date", [AMBER]: "Behind or changed", [RED]: "Error", [GRAY]: "Detached" };
+const STATUS_ALT = { [GREEN]: "Up to date", [AMBER]: "Behind or changed", [RED]: "Error", [GRAY]: "On a bare commit" };
 const CHIP_BORDER = "rgba(142, 142, 147, 0.28)";
-const PILL_BG = "rgba(88, 166, 255, 0.14)";
-const PILL_TEXT = "#58a6ff";
+const BLUE = "#58a6ff";
 const FILE_COLOR = { M: "warning", A: "success", D: "error", R: "suggestion", C: "suggestion", U: "error", T: "warning", "?": "subtle" };
 
 const timeOf = (ms) => (ms ? new Date(ms).toTimeString().slice(0, 5) : "");
@@ -436,24 +456,46 @@ function dot(color) {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="4" fill="${color}"/></svg>`;
 }
 
+const escapeXml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[c]);
+
+// The branch as a rounded pill with a branch mark, drawn as an image: a
+// Box's background has square corners. Width from the label's length.
+function pill(label, color = BLUE) {
+  const text = clip(label, 32);
+  const w = Math.round(22 + text.length * 6.6);
+  const icon = `<g fill="none" stroke="${color}" stroke-width="1.2" stroke-linecap="round"><circle cx="9" cy="5.5" r="1.4"/><circle cx="9" cy="12.5" r="1.4"/><circle cx="14" cy="7" r="1.4"/><path d="M9 6.9v4.2M14 8.4c0 2-2.5 2.2-4.6 3.3"/></g>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="18" viewBox="0 0 ${w} 18"><rect x="0.5" y="0.5" width="${w - 1}" height="17" rx="8.5" fill="${color}" fill-opacity="0.13" stroke="${color}" stroke-opacity="0.45"/>${icon}<text x="19" y="12.6" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="${color}">${escapeXml(text)}</text></svg>`;
+}
+
+function pillFor(wt) {
+  if (wt.branch) return { svg: pill(wt.branch), alt: `Branch ${wt.branch}`, width: Math.round(22 + clip(wt.branch, 32).length * 6.6) };
+  const label = wt.detachedFrom ? `${wt.detachedFrom} · detached` : `${String(wt.head ?? "").slice(0, 7)} · detached`;
+  const color = wt.detachedFrom ? BLUE : GRAY;
+  return { svg: pill(label, color), alt: `Detached at ${wt.detachedFrom ?? String(wt.head ?? "").slice(0, 7)}`, width: Math.round(22 + clip(label, 32).length * 6.6) };
+}
+
 function statusColor(repo, wt) {
   if (wt.error || (repo.fetchError && !wt.isChild)) return RED;
-  if (!wt.branch) return GRAY;
+  if (!wt.branch && !wt.detachedFrom) return GRAY;
   if (wt.behind || wt.files?.length) return AMBER;
   return GREEN;
 }
 
 // The one button a row offers, as a source list does: Publish a branch with
-// no upstream, Pull when behind, Push when ahead, Sync otherwise.
+// no upstream, Pull when behind, Push when ahead, Sync otherwise. A detached
+// worktree that is clean and only behind its ref can move up to it.
 function primaryAction(wt) {
-  if (wt.error || !wt.branch) return null;
+  if (wt.error) return null;
+  if (!wt.branch) {
+    return wt.detachedFrom && wt.behind && !wt.ahead && !wt.files?.length ? { kind: "advance", label: "Pull" } : null;
+  }
   if (!wt.upstream) return { kind: "push", label: "Publish" };
   if (wt.behind && !wt.ahead) return { kind: "pull", label: "Pull" };
   if (wt.ahead && !wt.behind) return { kind: "push", label: "Push" };
   return { kind: "sync", label: "Sync" };
 }
 
-const BUSY_LABEL = { pull: "Pulling…", push: "Pushing…", sync: "Syncing…" };
+const BUSY_LABEL = { pull: "Pulling…", push: "Pushing…", sync: "Syncing…", advance: "Pulling…" };
 
 function worktreeRow(ui, $, repo, wt, isChild) {
   const { Box, Text, Button, Svg } = ui;
@@ -482,8 +524,7 @@ function worktreeRow(ui, $, repo, wt, isChild) {
       onPress: () => { state.expanded[wt.path] = !isOpen; $.ui.invalidate("ui.render"); } }) : null,
     wt.behind ? Text({ key: "behind", color: "warning", bold: true, children: `↓${wt.behind}` }) : null,
     wt.ahead ? Text({ key: "ahead", color: "suggestion", bold: true, children: `↑${wt.ahead}` }) : null,
-    // The branch as a pill: tinted text, no taller than the row.
-    Text({ key: "branch", color: PILL_TEXT, backgroundColor: PILL_BG, wrap: "truncate-end", children: ` ${wt.branch ? `⎇ ${clip(wt.branch, 28)}` : "detached"} ` }),
+    (() => { const p = pillFor(wt); return Svg({ key: "branch", source: p.svg, alt: p.alt, width: p.width, height: 18 }); })(),
     action ? Button({ key: `${action.kind}:${wt.path}`, label: busy ? BUSY_LABEL[busy] : action.label, variant: "secondary", dimColor: !!busy,
       onPress: () => act($, repo.root, wt, action.kind) }) : null,
     // Unwatch shows while the pointer is on the row (the keyed "line").

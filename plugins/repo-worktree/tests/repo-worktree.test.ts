@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 const paneProps = { title: 'Repos', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 80 }, view: {} } as any
 
-type Git = { calls: string[][]; store: Record<string, unknown>; opened: number; behind?: number; ahead?: number; pullFails?: boolean; pruneFails?: boolean; envs?: any[] }
+type Git = { calls: string[][]; store: Record<string, unknown>; opened: number; behind?: number; ahead?: number; pullFails?: boolean; pruneFails?: boolean; detached?: boolean; envs?: any[] }
 
 const dir = (name: string, mtimeMs = 0) => ({ name, kind: 'dir', size: 0, mtimeMs, isLink: false })
 const file = (name: string) => ({ name, kind: 'file', size: 1, mtimeMs: 0, isLink: false })
@@ -52,8 +52,15 @@ function stubEngine(on: any, g: Git) {
     if (cmd === 'rev-parse --show-toplevel') return out(repo + '\n')
     if (cmd === 'worktree list --porcelain') {
       if (repo !== '/proj') return out(`worktree ${repo}\nHEAD abc\nbranch refs/heads/main\n\n`)
-      return out('worktree /proj\nHEAD abc\nbranch refs/heads/main\n\nworktree /proj/.wt/feature\nHEAD def\nbranch refs/heads/feature\n\n')
+      const review = g.detached ? 'worktree /proj/.wt/review\nHEAD ccc\ndetached\n\n' : ''
+      return out(`worktree /proj\nHEAD abc\nbranch refs/heads/main\n\nworktree /proj/.wt/feature\nHEAD def\nbranch refs/heads/feature\n\n${review}`)
     }
+    // A worktree checked out from origin/main, three commits behind it.
+    if (cmd === 'reflog -1 --format=%gs') return out('checkout: moving from abc to origin/main\n')
+    if (cmd === 'rev-parse --verify --quiet origin/main^{commit}') return out('fff\n')
+    if (cmd === 'rev-list --count HEAD..origin/main') return out('3\n')
+    if (cmd === 'rev-list --count origin/main..HEAD') return out('0\n')
+    if (cmd === 'status --porcelain=v2 --branch' && cwd === '/proj/.wt/review') return out('# branch.oid ccc\n# branch.head (detached)\n')
     if (cmd === 'status --porcelain=v2 --branch') {
       if (cwd === '/proj') return out(`# branch.oid abc\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +${g.ahead ?? 0} -${g.behind ?? 2}\n1 .M N... 100644 100644 100644 a b src/app.js\n? notes.txt\n`)
       return out('# branch.oid def\n# branch.head main\n')
@@ -86,13 +93,13 @@ test('the repos in the chat\'s folder are watched on their own, and the pane sho
   const drawn = JSON.stringify(await ui.drawn())
   // The repo row: the branch pill, behind count, changes, and the one
   // action that fits (behind, nothing ahead: Pull).
-  expect(drawn).toContain('⎇ main')
+  expect(drawn).toContain('"alt":"Branch main"')
   expect(drawn).toContain('↓2')
   expect(drawn).toContain('● 2')
   expect(drawn).toContain('"pull:/proj"')
   expect(drawn).toContain('1 worktree')
   // The worktree, nested, with no upstream: Publish.
-  expect(drawn).toContain('⎇ feature')
+  expect(drawn).toContain('"alt":"Branch feature"')
   expect(drawn).toContain('"push:/proj/.wt/feature"')
   expect(drawn).toContain('Publish')
   // Clutter that is gone.
@@ -236,11 +243,32 @@ test('worktrees are chips of their own, the branch a pill, and the repo path is 
   expect(chip.props.borderStyle).toBe('round')
   expect(findKey(tree, 'wt:/proj').props.borderStyle).toBeUndefined()
   const drawn = JSON.stringify(tree)
-  expect(drawn).toContain('"backgroundColor":"rgba(88, 166, 255, 0.14)"')
+  // The branch pill is a rounded image, not a square-cornered background.
+  expect(findKey(tree, 'wt:/proj').children[0].children.some((c: any) => c.type === 'Svg' && c.props.alt === 'Branch main' && c.props.source.includes('rx="8.5"'))).toBe(true)
+  expect(drawn).not.toContain('backgroundColor')
   expect(drawn).not.toContain('"   /proj"')
   expect(drawn).not.toContain('└')
   // Every status dot has an alt (the desktop drops an image without one).
   expect(drawn).toContain('"alt":"Behind or changed"')
   expect(drawn).not.toContain('"alt":""')
+  await ui.unmount()
+})
+
+test('a detached worktree names the ref it came from, counts how far behind it is, and Pull moves it up', { timeoutMs: 20_000 }, async ($, on) => {
+  const g: Git = { calls: [], store: { repos: ['/proj'], discovered: { at: Date.now(), repos: [] } }, opened: 0, detached: true }
+  stubEngine(on, g)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true } as any)
+  await run($, 'repos')
+  const ui = await mount($)
+  await settle(() => ran(g, 'rev-list --count'))
+  await new Promise((r) => setTimeout(r, 50))
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).toContain('"alt":"Detached at origin/main"')
+  expect(drawn).toContain('origin/main · detached')
+  expect(drawn).toContain('↓3')
+  expect(drawn).not.toContain('"alt":"On a bare commit"')
+  expect(drawn).toContain('"advance:/proj/.wt/review"')
+  await ui.press({ key: 'advance:/proj/.wt/review' })
+  expect(ran(g, 'checkout --detach origin/main')).toBe(true)
   await ui.unmount()
 })
