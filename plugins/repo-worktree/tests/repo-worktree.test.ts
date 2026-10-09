@@ -31,6 +31,7 @@ function stubEngine(on: any, g: Git) {
   for (const ev of ['command.register', 'ui.close', 'ui.toast']) on(ev as any, () => ({ value: undefined }))
   on('ui.open' as any, () => { g.opened++; return { value: { isPlaced: true } } })
   on('clock.every' as any, () => ({ deny: 'no timers in tests' }))
+  on('clock.after' as any, () => ({ deny: 'no timers in tests' }))
   on('store.get' as any, (_: any, e: any) => ({ value: g.store[e.key] }))
   on('store.set' as any, (_: any, e: any) => { g.store[e.key] = e.value; return { value: undefined } })
   on('env.get' as any, (_: any, e: any) => ({ value: e.name === 'HOME' ? '/home/me' : undefined }))
@@ -270,5 +271,41 @@ test('a detached worktree names the ref it came from, counts how far behind it i
   expect(drawn).toContain('"advance:/proj/.wt/review"')
   await ui.press({ key: 'advance:/proj/.wt/review' })
   expect(ran(g, 'checkout --detach origin/main')).toBe(true)
+  await ui.unmount()
+})
+
+test('success shows on the button for a moment, with no line added under the row', { timeoutMs: 20_000 }, async ($, on) => {
+  const g: Git = { calls: [], store: { repos: ['/proj'], discovered: { at: Date.now(), repos: [] } }, opened: 0, behind: 0, ahead: 0 }
+  stubEngine(on, g)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true } as any)
+  await run($, 'repos')
+  const ui = await mount($)
+  await settle(() => ran(g, 'status'))
+  await ui.drawn()
+  await ui.press({ key: 'sync:/proj' })
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).toContain('Synced ✓')
+  expect(drawn).not.toContain('In sync')
+  expect(drawn).not.toContain('"key":"msg"')
+  await ui.unmount()
+})
+
+test('the pill is sized to its text', { timeoutMs: 20_000 }, async ($, on) => {
+  const g: Git = { calls: [], store: { repos: ['/proj'], discovered: { at: Date.now(), repos: [] } }, opened: 0 }
+  stubEngine(on, g)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true } as any)
+  await run($, 'repos')
+  const ui = await mount($)
+  await settle(() => ran(g, 'status'))
+  const tree: any = await ui.drawn()
+  const pills: any[] = []
+  const walk = (n: any) => { if (n?.type === 'Svg' && String(n.props.alt).startsWith('Branch ')) pills.push(n); (n?.children ?? []).forEach(walk) }
+  walk(tree)
+  const main = pills.find((p) => p.props.alt === 'Branch main')
+  const feature = pills.find((p) => p.props.alt === 'Branch feature')
+  // "main" is narrower than "feature", and both hold their text to the measured width.
+  expect(main.props.width < feature.props.width).toBe(true)
+  expect(main.props.width < 60).toBe(true)
+  expect(main.props.source).toContain('lengthAdjust="spacingAndGlyphs"')
   await ui.unmount()
 })

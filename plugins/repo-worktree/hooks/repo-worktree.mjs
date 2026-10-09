@@ -33,7 +33,7 @@ const SKIP_DIRS = new Set([
 // computer; the rest is the pane's own.
 const state = {
   repos: [], dismissed: [], data: {}, expanded: {}, messages: {}, busy: {},
-  lastPress: {}, isOpen: false, isLoaded: false, isRefreshing: false, refreshedAt: 0, addError: "",
+  lastPress: {}, flash: {}, isOpen: false, isLoaded: false, isRefreshing: false, refreshedAt: 0, addError: "",
   found: [], foundAt: 0, isScanning: false,
 };
 
@@ -360,9 +360,25 @@ async function openPane($, focus) {
 
 // ── Actions ───────────────────────────────────────────────────────────────
 
+// An error gets a line under its row, kept until the next action.
 function say($, wtPath, text, isError = false) {
   state.messages[wtPath] = { text, isError };
   $.ui.invalidate("ui.render");
+}
+
+// Success is said on the button itself ("Synced ✓") for a moment, so nothing
+// moves: no line comes and goes.
+const FLASH_MS = 2200;
+function flash($, wtPath, text) {
+  state.flash[wtPath] = text;
+  $.ui.invalidate("ui.render");
+  try {
+    $.clock.after(FLASH_MS, () => {
+      if (state.flash[wtPath] !== text) return;
+      delete state.flash[wtPath];
+      $.ui.invalidate("ui.render");
+    });
+  } catch { /* cleared at the next refresh instead */ }
 }
 
 const lastLine = (r) => (r.err || r.out).trim().split(/\r?\n/).filter(Boolean).pop() ?? "";
@@ -387,13 +403,13 @@ async function act($, root, wt, kind) {
       // A detached worktree moves to the latest of the ref it came from.
       await fetchRepo($, root);
       r = await git($, wt.path, ["checkout", "--detach", wt.detachedFrom], 60_000);
-      say($, wt.path, r.ok ? `At the latest ${wt.detachedFrom}` : `Couldn't move: ${lastLine(r)}`, !r.ok);
+      if (r.ok) flash($, wt.path, "Pulled ✓"); else say($, wt.path, `Couldn't move: ${lastLine(r)}`, true);
     } else if (kind === "pull") {
       r = await git($, wt.path, ["pull", "--ff-only"], 120_000);
-      say($, wt.path, r.ok ? "Pulled" : `Pull stopped: ${lastLine(r)}`, !r.ok);
+      if (r.ok) flash($, wt.path, "Pulled ✓"); else say($, wt.path, `Pull stopped: ${lastLine(r)}`, true);
     } else if (kind === "push") {
       r = await push($, wt);
-      say($, wt.path, r.ok ? "Pushed" : `Push failed: ${lastLine(r)}`, !r.ok);
+      if (r.ok) flash($, wt.path, wt.upstream ? "Pushed ✓" : "Published ✓"); else say($, wt.path, `Push failed: ${lastLine(r)}`, true);
     } else {
       // Sync: fetch, fast-forward, then push. A diverged branch stops here
       // and says so instead of merging or rebasing on its own.
@@ -411,7 +427,7 @@ async function act($, root, wt, kind) {
         r = await push($, now);
         if (!r.ok) { say($, wt.path, `Push failed: ${lastLine(r)}`, true); return; }
       }
-      say($, wt.path, "In sync");
+      flash($, wt.path, "Synced ✓");
     }
   } finally {
     delete state.busy[wt.path];
@@ -458,20 +474,40 @@ function dot(color) {
 
 const escapeXml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[c]);
 
+// A label's width at 11.5px in the UI font, by character class (an image
+// can't measure text): narrow letters, wide ones, capitals, digits, the rest.
+const PILL_FONT = 11.5;
+function textWidth(s) {
+  let em = 0;
+  for (const c of s) {
+    if ("iIlj.,:;'|!".includes(c)) em += 0.25;
+    else if (" ·".includes(c)) em += 0.27;
+    else if ("frt-/()[]".includes(c)) em += 0.36;
+    else if ("mwMW".includes(c)) em += 0.84;
+    else if (/[A-Z]/.test(c)) em += 0.62;
+    else if (/[0-9]/.test(c)) em += 0.55;
+    else if (c === "_") em += 0.48;
+    else em += 0.52;
+  }
+  return em * PILL_FONT;
+}
+
 // The branch as a rounded pill with a branch mark, drawn as an image: a
-// Box's background has square corners. Width from the label's length.
+// Box's background has square corners. The text is held to the measured
+// width (`textLength`), so the pill fits it with even room at both ends.
 function pill(label, color = BLUE) {
   const text = clip(label, 32);
-  const w = Math.round(22 + text.length * 6.6);
+  const tw = Math.ceil(textWidth(text));
+  const w = 19 + tw + 8;
   const icon = `<g fill="none" stroke="${color}" stroke-width="1.2" stroke-linecap="round"><circle cx="9" cy="5.5" r="1.4"/><circle cx="9" cy="12.5" r="1.4"/><circle cx="14" cy="7" r="1.4"/><path d="M9 6.9v4.2M14 8.4c0 2-2.5 2.2-4.6 3.3"/></g>`;
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="18" viewBox="0 0 ${w} 18"><rect x="0.5" y="0.5" width="${w - 1}" height="17" rx="8.5" fill="${color}" fill-opacity="0.13" stroke="${color}" stroke-opacity="0.45"/>${icon}<text x="19" y="12.6" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="${color}">${escapeXml(text)}</text></svg>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="18" viewBox="0 0 ${w} 18"><rect x="0.5" y="0.5" width="${w - 1}" height="17" rx="8.5" fill="${color}" fill-opacity="0.13" stroke="${color}" stroke-opacity="0.45"/>${icon}<text x="19" y="12.6" textLength="${tw}" lengthAdjust="spacingAndGlyphs" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="${PILL_FONT}" fill="${color}">${escapeXml(text)}</text></svg>`;
+  return { svg, width: w };
 }
 
 function pillFor(wt) {
-  if (wt.branch) return { svg: pill(wt.branch), alt: `Branch ${wt.branch}`, width: Math.round(22 + clip(wt.branch, 32).length * 6.6) };
+  if (wt.branch) return { ...pill(wt.branch), alt: `Branch ${wt.branch}` };
   const label = wt.detachedFrom ? `${wt.detachedFrom} · detached` : `${String(wt.head ?? "").slice(0, 7)} · detached`;
-  const color = wt.detachedFrom ? BLUE : GRAY;
-  return { svg: pill(label, color), alt: `Detached at ${wt.detachedFrom ?? String(wt.head ?? "").slice(0, 7)}`, width: Math.round(22 + clip(label, 32).length * 6.6) };
+  return { ...pill(label, wt.detachedFrom ? BLUE : GRAY), alt: `Detached at ${wt.detachedFrom ?? String(wt.head ?? "").slice(0, 7)}` };
 }
 
 function statusColor(repo, wt) {
@@ -525,8 +561,16 @@ function worktreeRow(ui, $, repo, wt, isChild) {
     wt.behind ? Text({ key: "behind", color: "warning", bold: true, children: `↓${wt.behind}` }) : null,
     wt.ahead ? Text({ key: "ahead", color: "suggestion", bold: true, children: `↑${wt.ahead}` }) : null,
     (() => { const p = pillFor(wt); return Svg({ key: "branch", source: p.svg, alt: p.alt, width: p.width, height: 18 }); })(),
-    action ? Button({ key: `${action.kind}:${wt.path}`, label: busy ? BUSY_LABEL[busy] : action.label, variant: "secondary", dimColor: !!busy,
-      onPress: () => act($, repo.root, wt, action.kind) }) : null,
+    // The action button, which also says how its last press went ("Synced ✓")
+    // for a moment, even where no action is left to offer.
+    action || state.flash[wt.path]
+      ? Button({
+          key: `${action?.kind ?? "done"}:${wt.path}`,
+          label: busy ? BUSY_LABEL[busy] : state.flash[wt.path] ?? action.label,
+          variant: "secondary", dimColor: !!busy || !action,
+          onPress: () => { if (action) act($, repo.root, wt, action.kind); },
+        })
+      : null,
     // Unwatch shows while the pointer is on the row (the keyed "line").
     !isChild ? Box({ display: "none", hover: { display: "flex" }, children: [
       Button({ key: `unwatch:${repo.root}`, label: "✕", plain: true, dimColor: true, onPress: () => removeRepo($, repo.root) }),
