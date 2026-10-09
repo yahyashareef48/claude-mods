@@ -19,7 +19,6 @@ const STORE_FOUND = "discovered";
 const RESCAN_MS = 24 * 60 * 60_000;
 const SCAN_DEPTH = 4;
 const SCAN_BUDGET = 3000;
-const FOUND_SHOWN = 8;
 
 // Folders a repo is never under, or too big to walk for nothing.
 const SKIP_DIRS = new Set([
@@ -35,7 +34,7 @@ const SKIP_DIRS = new Set([
 const state = {
   repos: [], dismissed: [], data: {}, expanded: {}, messages: {}, busy: {},
   lastPress: {}, isOpen: false, isLoaded: false, isRefreshing: false, refreshedAt: 0, addError: "",
-  found: [], foundAt: 0, isScanning: false, query: "", showAllFound: false,
+  found: [], foundAt: 0, isScanning: false,
 };
 
 // ── git ───────────────────────────────────────────────────────────────────
@@ -53,10 +52,16 @@ const samePath = (a, b) => (isWindowsPath(a) ? norm(a).toLowerCase() === norm(b)
 
 // Never asks for a password (a fetch with no credentials fails instead of
 // hanging) and takes no optional locks, so a refresh never blocks the user's
-// own git.
+// own git. Long paths on: Git for Windows has them off, and a long branch
+// name then fails a fetch with "Filename too long".
+const GIT_ENV = {
+  GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0",
+  GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.longpaths", GIT_CONFIG_VALUE_0: "true",
+};
+
 async function git($, cwd, args, timeoutMs = 30_000) {
   try {
-    const r = await $.process.run(["git", ...args], { cwd, env: { GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" }, timeoutMs });
+    const r = await $.process.run(["git", ...args], { cwd, env: GIT_ENV, timeoutMs });
     return { ok: r.exitCode === 0, out: r.stdout ?? "", err: (r.stderr ?? "").trim() };
   } catch (error) {
     return { ok: false, out: "", err: String(error?.message ?? error) };
@@ -90,7 +95,6 @@ function parseWorktrees(text) {
   }).filter((wt) => wt.path);
 }
 
-const STATUS_NAME = { M: "modified", A: "added", D: "deleted", R: "renamed", C: "copied", U: "conflict", T: "type changed" };
 
 // `git status --porcelain=v2 --branch`: the branch, its upstream, ahead and
 // behind, and one entry per changed path.
@@ -162,7 +166,14 @@ async function loadRepo($, root) {
 
 async function fetchRepo($, root) {
   const r = await git($, root, ["fetch", "--all", "--prune", "--quiet"], 120_000);
-  return r.ok ? "" : r.err.split(/\r?\n/).pop();
+  if (r.ok) return "";
+  // A remote branch whose name the file system can't hold (a `"` on
+  // Windows) fails the prune alone: fetch again without it.
+  if (/could not delete references/i.test(r.err)) {
+    const plain = await git($, root, ["fetch", "--all", "--quiet"], 120_000);
+    return plain.ok ? "" : plain.err.split(/\r?\n/).pop();
+  }
+  return r.err.split(/\r?\n/).pop();
 }
 
 // ── Finding repos ─────────────────────────────────────────────────────────
@@ -288,6 +299,8 @@ async function refreshRepo($, root, { fetch = true } = {}) {
 async function refreshAll($, { fetch = true } = {}) {
   if (state.isRefreshing) return;
   state.isRefreshing = true;
+  // A success note ("Pushed") lasts until the next refresh; an error stays.
+  for (const [path, m] of Object.entries(state.messages)) if (!m.isError) delete state.messages[path];
   $.ui.invalidate("ui.render");
   try { await Promise.all(state.repos.map((root) => refreshRepo($, root, { fetch }))); }
   finally {
@@ -320,7 +333,6 @@ async function removeRepo($, root) {
   $.ui.invalidate("ui.render");
 }
 
-const looksLikePath = (s) => /[\\/]/.test(s) || /^[A-Za-z]:/.test(s) || s.startsWith("~");
 
 async function openPane($, focus) {
   state.isOpen = true;
@@ -351,7 +363,8 @@ async function act($, root, wt, kind) {
   if (state.busy[wt.path]) return;
   if (!wt.branch) { say($, wt.path, "Detached HEAD: check out a branch first", true); return; }
   state.busy[wt.path] = kind;
-  say($, wt.path, `${kind === "pull" ? "Pulling" : kind === "push" ? "Pushing" : "Syncing"}…`);
+  delete state.messages[wt.path];
+  $.ui.invalidate("ui.render");
   try {
     let r;
     if (kind === "pull") {
@@ -361,12 +374,14 @@ async function act($, root, wt, kind) {
       r = await push($, wt);
       say($, wt.path, r.ok ? "Pushed" : `Push failed: ${lastLine(r)}`, !r.ok);
     } else {
-      // Sync: fast-forward only, then push. A diverged branch stops here and
-      // says so instead of merging or rebasing on its own.
-      if (wt.upstream && wt.behind > 0) {
+      // Sync: fetch, fast-forward, then push. A diverged branch stops here
+      // and says so instead of merging or rebasing on its own.
+      await fetchRepo($, root);
+      const fresh = await loadWorktree($, wt);
+      if (fresh.upstream && fresh.behind > 0) {
         r = await git($, wt.path, ["pull", "--ff-only"], 120_000);
         if (!r.ok) {
-          say($, wt.path, wt.ahead > 0 ? `Diverged from ${wt.upstream} (${wt.ahead} ahead, ${wt.behind} behind): rebase or merge first` : `Pull stopped: ${lastLine(r)}`, true);
+          say($, wt.path, fresh.ahead > 0 ? `Diverged from ${fresh.upstream} (${fresh.ahead} ahead, ${fresh.behind} behind): rebase or merge first` : `Pull stopped: ${lastLine(r)}`, true);
           return;
         }
       }
@@ -400,210 +415,146 @@ async function pressRepo($, root) {
 }
 
 // ── View ──────────────────────────────────────────────────────────────────
+// After a source list: one chip per repo with its worktrees nested under it,
+// each row a status dot, a name, ahead/behind, the branch as a pill and the
+// one action that fits. Details (changed files, errors) wait to be asked for.
 
+const GREEN = "#34c759", AMBER = "#ff9f0a", RED = "#ff453a", GRAY = "#8e8e93";
+const CHIP_BORDER = "rgba(142, 142, 147, 0.28)";
+const PILL_BORDER = "rgba(88, 166, 255, 0.45)";
+const PILL_TEXT = "#58a6ff";
 const FILE_COLOR = { M: "warning", A: "success", D: "error", R: "suggestion", C: "suggestion", U: "error", T: "warning", "?": "subtle" };
-const CHIP_BORDER = "rgba(142, 142, 147, 0.32)";
 
 const timeOf = (ms) => (ms ? new Date(ms).toTimeString().slice(0, 5) : "");
 const plural = (n, one, many = one + "s") => `${n} ${n === 1 ? one : many}`;
+const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+// The part of a git error worth reading: what follows its last colon.
+const shortError = (s) => clip(String(s).trim().split(/:\s+/).filter(Boolean).pop() ?? String(s), 60);
 
-function worktreeLabel(root, wt) {
-  if (samePath(wt.path, root)) return "main worktree";
-  const rel = norm(wt.path).toLowerCase().startsWith(norm(root).toLowerCase() + "/") ? norm(wt.path).slice(norm(root).length + 1) : baseName(wt.path);
-  return `worktree · ${rel}`;
+function dot(color) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="4" fill="${color}"/></svg>`;
 }
 
-function worktreeChip(ui, $, repo, wt) {
-  const { Box, Text, Button } = ui;
+function statusColor(repo, wt) {
+  if (wt.error || (repo.fetchError && !wt.isChild)) return RED;
+  if (!wt.branch) return GRAY;
+  if (wt.behind || wt.files?.length) return AMBER;
+  return GREEN;
+}
+
+// The one button a row offers, as a source list does: Publish a branch with
+// no upstream, Pull when behind, Push when ahead, Sync otherwise.
+function primaryAction(wt) {
+  if (wt.error || !wt.branch) return null;
+  if (!wt.upstream) return { kind: "push", label: "Publish" };
+  if (wt.behind && !wt.ahead) return { kind: "pull", label: "Pull" };
+  if (wt.ahead && !wt.behind) return { kind: "push", label: "Push" };
+  return { kind: "sync", label: "Sync" };
+}
+
+const BUSY_LABEL = { pull: "Pulling…", push: "Pushing…", sync: "Syncing…" };
+
+function worktreeRow(ui, $, repo, wt, isChild) {
+  const { Box, Text, Button, Svg } = ui;
   const busy = state.busy[wt.path];
   const msg = state.messages[wt.path];
-  const isOpen = !!state.expanded[wt.path];
   const changes = wt.files?.length ?? 0;
-  const tracking = [];
-  if (wt.error) tracking.push(Text({ key: "err", color: "error", children: wt.error }));
-  else {
-    if (!wt.upstream && wt.branch) tracking.push(Text({ key: "noup", dimColor: true, children: "no upstream" }));
-    if (wt.behind) tracking.push(Text({ key: "behind", color: "warning", bold: true, children: `↓${wt.behind} behind` }));
-    if (wt.ahead) tracking.push(Text({ key: "ahead", color: "suggestion", children: `↑${wt.ahead} ahead` }));
-    if (wt.upstream && !wt.ahead && !wt.behind) tracking.push(Text({ key: "even", dimColor: true, children: "up to date" }));
-  }
-  const summary = changes
-    ? [Text({ key: "files", dimColor: true, children: plural(changes, "change") }), Text({ key: "add", color: "success", children: `+${wt.add ?? 0}` }), Text({ key: "del", color: "error", children: `−${wt.del ?? 0}` })]
-    : [Text({ key: "clean", dimColor: true, children: "clean" })];
-  const action = (kind, label, isUseful) => Button({
-    key: `${kind}:${wt.path}`, label: busy === kind ? `${label}…` : label, variant: "secondary", dimColor: !isUseful || !!busy,
-    onPress: () => act($, repo.root, wt, kind),
-  });
+  const isOpen = !!state.expanded[wt.path];
+  const action = primaryAction(wt);
+  const name = isChild ? baseName(wt.path) : repo.name;
+  const others = repo.worktrees.length - 1;
+  const note = wt.error ? shortError(wt.error) : !isChild && repo.fetchError ? `Fetch failed: ${shortError(repo.fetchError)}` : "";
 
-  return Box({ key: `wt-${wt.path}`, flexDirection: "column", children: [
-    Box({
-      key: "chip", flexDirection: "row", alignItems: "center", gap: 1, paddingX: 1,
-      borderStyle: "round", borderColor: wt.behind ? "warning" : CHIP_BORDER,
-      children: [
-        Box({ key: "name", flexDirection: "column", flexGrow: 1, flexShrink: 1, children: [
-          Box({ key: "line1", flexDirection: "row", gap: 1, alignItems: "center", children: [
-            Button({ key: `branch:${wt.path}`, label: `${isOpen ? "▾" : "▸"} ${wt.branch ?? (wt.detached ? `detached ${String(wt.head ?? "").slice(0, 7)}` : "?")}`, plain: true,
-              onPress: () => { state.expanded[wt.path] = !isOpen; $.ui.invalidate("ui.render"); } }),
-            ...tracking,
-          ] }),
-          Box({ key: "line2", flexDirection: "row", gap: 1, children: [
-            Text({ key: "where", dimColor: true, wrap: "truncate-end", children: worktreeLabel(repo.root, wt) }),
-            Text({ key: "dot", dimColor: true, children: "·" }),
-            ...summary,
-          ] }),
-        ] }),
-        Box({ key: "actions", flexDirection: "row", gap: 1, flexShrink: 0, children: [
-          action("pull", "Pull", !!wt.behind),
-          action("push", "Push", !!wt.ahead || (!wt.upstream && !!wt.branch)),
-          action("sync", "Sync", !!wt.behind || !!wt.ahead || (!wt.upstream && !!wt.branch)),
-        ] }),
-      ],
-    }),
-    msg ? Text({ key: "msg", color: msg.isError ? "error" : undefined, dimColor: !msg.isError, children: `  ${msg.text}` }) : null,
-    isOpen ? Box({ key: "files", flexDirection: "column", paddingX: 2, children: changes
-      ? [
-          ...wt.files.slice(0, MAX_FILES).map((f, n) => Box({ key: `f${n}`, flexDirection: "row", gap: 1, children: [
-            Text({ key: "code", color: FILE_COLOR[f.code] ?? "subtle", bold: true, children: f.code === "?" ? "U" : f.code }),
-            Text({ key: "path", wrap: "truncate-start", children: f.path }),
-            Text({ key: "what", dimColor: true, children: f.code === "?" ? "untracked" : `${STATUS_NAME[f.code] ?? ""}${f.staged ? " · staged" : ""}` }),
-          ] })),
-          wt.files.length > MAX_FILES ? Text({ key: "more", dimColor: true, children: `… ${wt.files.length - MAX_FILES} more` }) : null,
-        ].filter(Boolean)
-      : [Text({ key: "none", dimColor: true, children: "No changes" })] }) : null,
+  const line = Box({ key: "line", flexDirection: "row", alignItems: "center", gap: 1, children: [
+    isChild ? Text({ key: "elbow", dimColor: true, children: "└" }) : null,
+    Svg({ key: "dot", source: dot(statusColor(repo, { ...wt, isChild })), alt: "", width: 8, height: 8 }),
+    isChild
+      ? Text({ key: "name", children: name })
+      : Button({ key: `open:${repo.root}`, label: name, plain: true, onPress: () => pressRepo($, repo.root) }),
+    !isChild && others > 0 ? Text({ key: "count", dimColor: true, children: plural(others, "worktree") }) : null,
+    Box({ key: "gap", flexGrow: 1 }),
+    changes ? Button({ key: `files:${wt.path}`, label: `● ${changes}`, plain: true, dimColor: !isOpen,
+      onPress: () => { state.expanded[wt.path] = !isOpen; $.ui.invalidate("ui.render"); } }) : null,
+    wt.behind ? Text({ key: "behind", color: "warning", bold: true, children: `↓${wt.behind}` }) : null,
+    wt.ahead ? Text({ key: "ahead", color: "suggestion", bold: true, children: `↑${wt.ahead}` }) : null,
+    Box({ key: "pill", borderStyle: "round", borderColor: PILL_BORDER, paddingX: 1, flexShrink: 0, children: [
+      Text({ key: "branch", color: PILL_TEXT, wrap: "truncate-end", children: wt.branch ? `⎇ ${clip(wt.branch, 28)}` : "detached" }),
+    ] }),
+    action ? Button({ key: `${action.kind}:${wt.path}`, label: busy ? BUSY_LABEL[busy] : action.label, variant: "secondary", dimColor: !!busy,
+      onPress: () => act($, repo.root, wt, action.kind) }) : null,
+    // Unwatch shows while the pointer is on the row (the keyed "line").
+    !isChild ? Box({ display: "none", hover: { display: "flex" }, children: [
+      Button({ key: `unwatch:${repo.root}`, label: "✕", plain: true, dimColor: true, onPress: () => removeRepo($, repo.root) }),
+    ] }) : null,
+  ].filter(Boolean) });
+
+  return Box({ key: `wt:${wt.path}`, flexDirection: "column", paddingLeft: isChild ? 1 : 0, children: [
+    line,
+    !isChild ? Text({ key: "path", dimColor: true, wrap: "truncate-start", children: `   ${repo.root}` }) : null,
+    note ? Text({ key: "note", color: "error", dimColor: true, wrap: "truncate-end", children: `   ${note}` }) : null,
+    msg ? Text({ key: "msg", color: msg.isError ? "error" : undefined, dimColor: !msg.isError, wrap: "truncate-end", children: `   ${msg.text}` }) : null,
+    isOpen && changes ? Box({ key: "files", flexDirection: "column", paddingLeft: 3, children: wt.files.slice(0, MAX_FILES).map((f, n) =>
+      Box({ key: `f${n}`, flexDirection: "row", gap: 1, children: [
+        Text({ key: "code", color: FILE_COLOR[f.code] ?? "subtle", bold: true, children: f.code === "?" ? "U" : f.code }),
+        Text({ key: "path", dimColor: true, wrap: "truncate-start", children: f.path }),
+      ] })) }) : null,
   ].filter(Boolean) });
 }
 
 function repoCard(ui, $, root) {
-  const { Box, Text, Button } = ui;
+  const { Box, Text } = ui;
   const repo = state.data[root];
-  const behind = repo?.worktrees?.reduce((n, wt) => n + (wt.behind || 0), 0) ?? 0;
-  const head = Box({ key: "head", flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 1, children: [
-    Box({ key: "title", flexDirection: "row", gap: 1, alignItems: "center", flexShrink: 1, children: [
-      Button({ key: `open:${root}`, label: baseName(root), plain: true, onPress: () => pressRepo($, root) }),
-      Text({ key: "path", dimColor: true, wrap: "truncate-start", children: root }),
-    ] }),
-    Box({ key: "tools", flexDirection: "row", gap: 1, flexShrink: 0, alignItems: "center", children: [
-      behind ? Text({ key: "behind", color: "warning", children: `${behind} behind` }) : null,
-      Button({ key: `unwatch:${root}`, label: "Unwatch", plain: true, dimColor: true, onPress: () => removeRepo($, root) }),
-    ].filter(Boolean) }),
-  ] });
+  const children = repo
+    ? [
+        ...repo.worktrees.slice(0, 1).map((wt) => worktreeRow(ui, $, repo, wt, false)),
+        ...repo.worktrees.slice(1).map((wt) => worktreeRow(ui, $, repo, wt, true)),
+        repo.error && !repo.worktrees.length ? Text({ key: "error", color: "error", dimColor: true, children: `${baseName(root)}: ${shortError(repo.error)}` }) : null,
+      ].filter(Boolean)
+    : [Text({ key: "loading", dimColor: true, children: `${baseName(root)}  ·  loading…` })];
+  return Box({ key: `repo:${root}`, flexDirection: "column", paddingX: 1, borderStyle: "round", borderColor: CHIP_BORDER, children });
+}
 
-  if (!repo) return Box({ key: `repo-${root}`, flexDirection: "column", gap: 1, padding: 1, borderStyle: "round", borderColor: "subtle", children: [
-    head, Text({ key: "loading", dimColor: true, children: "Loading…" }),
-  ] });
-
-  const branches = repo.branches?.length
-    ? Box({ key: "branches", flexDirection: "column", paddingX: 1, children: [
-        Text({ key: "label", dimColor: true, bold: true, children: "Other branches" }),
-        ...repo.branches.map((b) => Box({ key: `b-${b.name}`, flexDirection: "row", gap: 1, children: [
-          Text({ key: "name", children: b.name }),
-          b.gone ? Text({ key: "gone", color: "error", dimColor: true, children: "upstream gone" })
-            : !b.upstream ? Text({ key: "local", dimColor: true, children: "local only" })
-            : null,
-          b.behind ? Text({ key: "behind", color: "warning", children: `↓${b.behind}` }) : null,
-          b.ahead ? Text({ key: "ahead", color: "suggestion", children: `↑${b.ahead}` }) : null,
-        ].filter(Boolean) })),
-      ] })
-    : null;
-
-  return Box({ key: `repo-${root}`, flexDirection: "column", gap: 1, padding: 1, borderStyle: "round", borderColor: "subtle", children: [
-    head,
-    repo.error ? Text({ key: "error", color: "error", children: repo.error }) : null,
-    repo.fetchError ? Text({ key: "fetch", color: "warning", dimColor: true, children: `Fetch failed: ${repo.fetchError}` }) : null,
-    ...repo.worktrees.map((wt) => worktreeChip(ui, $, repo, wt)),
-    branches,
-  ].filter(Boolean) });
+// The unwatched repos on this computer, as one menu; picking one watches it.
+function addMenu(ui, $) {
+  const { Select } = ui;
+  if (!Select) return null;
+  const candidates = state.found.filter((f) => !isWatched(f.path));
+  const parent = (p) => baseName(norm(p).slice(0, norm(p).lastIndexOf("/")));
+  const options = [
+    { value: "", label: state.isScanning ? "Looking for repos…" : candidates.length ? `Add repo (${candidates.length})` : "Add repo" },
+    ...candidates.map((f) => ({ value: f.path, label: `${baseName(f.path)}  ·  ${parent(f.path)}` })),
+    { value: "__rescan__", label: "Rescan this computer" },
+  ];
+  return Select({ key: "add", options, value: "", onSelect: (value) => {
+    if (value === "__rescan__") return discover($, { force: true });
+    if (value) return addRepo($, value);
+  } });
 }
 
 function paneView($, e) {
   const ui = $.ui.resolve(e);
-  const { Box, Text, Button, Input, Markdown } = ui;
+  const { Box, Text, Button } = ui;
   const behind = Object.values(state.data).reduce((n, r) => n + (r.worktrees ?? []).reduce((m, wt) => m + (wt.behind || 0), 0), 0);
   const sub = [
     plural(state.repos.length, "repo"),
     behind ? `${behind} behind` : "",
-    state.isRefreshing ? "refreshing…" : state.refreshedAt ? `fetched ${timeOf(state.refreshedAt)}` : "",
+    state.isRefreshing ? "refreshing…" : timeOf(state.refreshedAt),
   ].filter(Boolean).join(" · ");
 
-  const header = Box({ key: "header", flexDirection: "row", justifyContent: "space-between", alignItems: "flex-end", paddingX: 1, children: [
-    Box({ key: "heading", flexDirection: "column", children: [
-      Markdown ? Markdown({ key: "title", text: "### Repos" }) : Text({ key: "title", bold: true, children: "Repos" }),
-      Text({ key: "sub", dimColor: true, children: sub }),
-    ] }),
-    Button({ key: "refresh", label: state.isRefreshing ? "Refreshing…" : "Refresh", variant: "secondary", dimColor: state.isRefreshing, onPress: () => refreshAll($) }),
-  ] });
-
-  const body = state.repos.length
-    ? state.repos.map((root) => repoCard(ui, $, root))
-    : [Text({ key: "empty", dimColor: true, children: "No repos in this folder. Pick some below, or paste a folder's path." })];
+  const header = Box({ key: "header", flexDirection: "row", alignItems: "center", gap: 1, paddingX: 1, children: [
+    Text({ key: "title", bold: true, children: "Repos" }),
+    Text({ key: "sub", dimColor: true, children: sub }),
+    Box({ key: "gap", flexGrow: 1 }),
+    addMenu(ui, $),
+    Button({ key: "refresh", label: "Refresh", variant: "secondary", dimColor: state.isRefreshing, onPress: () => refreshAll($) }),
+  ].filter(Boolean) });
 
   return Box({ flexDirection: "column", gap: 1, padding: 1, children: [
-    header, ...body,
-    state.repos.length ? Text({ key: "tip", dimColor: true, children: "Double-click a repo's name to open it in VS Code. Click a branch to list its changes." }) : null,
-    addSection(ui, $),
-  ].filter(Boolean) });
-}
-
-// The repos on this computer not yet watched: searchable, a Watch button
-// each. The field takes a pasted path too.
-function addSection(ui, $) {
-  const { Box, Text, Button, Input } = ui;
-  const q = state.query.trim().toLowerCase();
-  const candidates = state.found.filter((f) => !isWatched(f.path));
-  const matches = q && !looksLikePath(q)
-    ? candidates.filter((f) => baseName(f.path).toLowerCase().includes(q) || f.path.toLowerCase().includes(q))
-    : candidates;
-  const shown = state.showAllFound || q ? matches.slice(0, 100) : matches.slice(0, FOUND_SHOWN);
-  const status = state.isScanning
-    ? "Looking for repos on this computer…"
-    : state.foundAt ? `${plural(candidates.length, "more repo")} on this computer` : "";
-
-  const rows = shown.map((f) => Box({
-    key: `found:${f.path}`, flexDirection: "row", alignItems: "center", gap: 1, paddingX: 1,
-    borderStyle: "round", borderColor: CHIP_BORDER,
-    children: [
-      Box({ key: "names", flexDirection: "row", gap: 1, flexGrow: 1, flexShrink: 1, alignItems: "center", children: [
-        Text({ key: "name", bold: true, children: baseName(f.path) }),
-        f.isRecent ? Text({ key: "recent", color: "suggestion", dimColor: true, children: "used with Claude" }) : null,
-        Text({ key: "path", dimColor: true, wrap: "truncate-start", children: f.path }),
-      ].filter(Boolean) }),
-      Button({ key: `watch:${f.path}`, label: "Watch", variant: "secondary", onPress: () => addRepo($, f.path) }),
-    ],
-  }));
-
-  return Box({ key: "add", flexDirection: "column", gap: 1, children: [
-    Box({ key: "add-head", flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingX: 1, children: [
-      Box({ key: "add-title", flexDirection: "column", children: [
-        Text({ key: "label", bold: true, children: "Add more" }),
-        status ? Text({ key: "status", dimColor: true, children: status }) : null,
-      ].filter(Boolean) }),
-      Box({ key: "add-tools", flexDirection: "row", gap: 1, children: [
-        Button({ key: "add-here", label: "Watch repos in this folder", variant: "secondary", onPress: async () => {
-          const { added, found } = await watchFolder($, await $.session.cwd(), { isManual: true });
-          state.addError = found ? (added.length ? "" : "Every repo in this folder is already watched") : "No repos in this folder";
-          $.ui.invalidate("ui.render");
-        } }),
-        Button({ key: "rescan", label: state.isScanning ? "Scanning…" : "Rescan", variant: "secondary", dimColor: state.isScanning, onPress: () => discover($, { force: true }) }),
-      ] }),
-    ] }),
-    Input
-      ? Box({ key: "field", paddingX: 1, children: [Input({
-          key: "search", placeholder: "Search repos, or paste a folder's path", submitLabel: "Watch",
-          onInput: (value) => { state.query = value; state.addError = ""; $.ui.invalidate("ui.render"); },
-          onSubmit: (value) => {
-            const v = value.trim();
-            if (looksLikePath(v)) return addRepo($, v);
-            if (matches[0]) return addRepo($, matches[0].path);
-          },
-        })] })
-      : Text({ key: "hint", dimColor: true, children: "/watch <path> adds a repo" }),
-    state.addError ? Text({ key: "add-error", color: "error", children: `  ${state.addError}` }) : null,
-    ...rows,
-    !q && matches.length > FOUND_SHOWN
-      ? Button({ key: "show-all", label: state.showAllFound ? "Show fewer" : `Show all ${matches.length}`, plain: true, dimColor: true,
-          onPress: () => { state.showAllFound = !state.showAllFound; $.ui.invalidate("ui.render"); } })
-      : null,
-    q && !looksLikePath(q) && !matches.length ? Text({ key: "none", dimColor: true, children: "  No repo by that name. Paste its folder's path instead." }) : null,
+    header,
+    state.addError ? Text({ key: "add-error", color: "error", dimColor: true, children: `  ${state.addError}` }) : null,
+    ...(state.repos.length
+      ? state.repos.map((root) => repoCard(ui, $, root))
+      : [Text({ key: "empty", dimColor: true, children: "  No repos yet. Add one from the menu." })]),
   ].filter(Boolean) });
 }
 
