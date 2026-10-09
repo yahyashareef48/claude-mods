@@ -420,6 +420,7 @@ async function pressRepo($, root) {
 // one action that fits. Details (changed files, errors) wait to be asked for.
 
 const GREEN = "#34c759", AMBER = "#ff9f0a", RED = "#ff453a", GRAY = "#8e8e93";
+const STATUS_ALT = { [GREEN]: "Up to date", [AMBER]: "Behind or changed", [RED]: "Error", [GRAY]: "Detached" };
 const CHIP_BORDER = "rgba(142, 142, 147, 0.28)";
 const PILL_BG = "rgba(88, 166, 255, 0.14)";
 const PILL_TEXT = "#58a6ff";
@@ -470,7 +471,8 @@ function worktreeRow(ui, $, repo, wt, isChild) {
   const note = wt.error ? shortError(wt.error) : !isChild && repo.fetchError ? `Fetch failed: ${shortError(repo.fetchError)}` : "";
 
   const line = Box({ key: "line", flexDirection: "row", alignItems: "center", gap: 1, children: [
-    Svg({ key: "dot", source: dot(statusColor(repo, { ...wt, isChild })), alt: "", width: 8, height: 8 }),
+    // The dot needs an alt: the desktop draws no image without one.
+    Svg({ key: "dot", source: dot(statusColor(repo, { ...wt, isChild })), alt: STATUS_ALT[statusColor(repo, { ...wt, isChild })], width: 8, height: 8 }),
     isChild
       ? Text({ key: "name", wrap: "truncate-end", children: name })
       : Button({ key: `open:${repo.root}`, label: name, plain: true, onPress: () => pressRepo($, repo.root) }),
@@ -515,7 +517,8 @@ function repoCard(ui, $, root) {
       ].filter(Boolean)
     : [Text({ key: "loading", dimColor: true, children: `${baseName(root)}  ·  loading…` })];
   const hasChips = (repo?.worktrees.length ?? 0) > 1;
-  return Box({ key: `repo:${root}`, flexDirection: "column", gap: hasChips ? 1 : 0, paddingX: 1, paddingBottom: hasChips ? 1 : 0, borderStyle: "round", borderColor: CHIP_BORDER, children });
+  // Even room on every side, so a row's button never meets the border.
+  return Box({ key: `repo:${root}`, flexDirection: "column", gap: hasChips ? 1 : 0, padding: 1, borderStyle: "round", borderColor: CHIP_BORDER, children });
 }
 
 // The unwatched repos on this computer, as one menu; picking one watches it.
