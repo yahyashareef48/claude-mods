@@ -239,5 +239,8 @@ test('worktrees are chips of their own, the branch a pill, and the repo path is 
   expect(drawn).toContain('"backgroundColor":"rgba(88, 166, 255, 0.14)"')
   expect(drawn).not.toContain('"   /proj"')
   expect(drawn).not.toContain('└')
+  // Every status dot has an alt (the desktop drops an image without one).
+  expect(drawn).toContain('"alt":"Behind or changed"')
+  expect(drawn).not.toContain('"alt":""')
   await ui.unmount()
 })
