@@ -222,3 +222,22 @@ test('a prune the file system refuses falls back to a plain fetch, with no error
   expect(JSON.stringify(await ui.drawn())).not.toContain('Fetch failed')
   await ui.unmount()
 })
+
+test('worktrees are chips of their own, the branch a pill, and the repo path is not shown', { timeoutMs: 20_000 }, async ($, on) => {
+  const g: Git = { calls: [], store: { repos: ['/proj'], discovered: { at: Date.now(), repos: [] } }, opened: 0 }
+  stubEngine(on, g)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true } as any)
+  await run($, 'repos')
+  const ui = await mount($)
+  await settle(() => ran(g, 'status'))
+  const tree: any = await ui.drawn()
+  const findKey = (n: any, key: string): any => n?.props?.key === key ? n : (n?.children ?? []).map((c: any) => findKey(c, key)).find(Boolean)
+  const chip = findKey(tree, 'wt:/proj/.wt/feature')
+  expect(chip.props.borderStyle).toBe('round')
+  expect(findKey(tree, 'wt:/proj').props.borderStyle).toBeUndefined()
+  const drawn = JSON.stringify(tree)
+  expect(drawn).toContain('"backgroundColor":"rgba(88, 166, 255, 0.14)"')
+  expect(drawn).not.toContain('"   /proj"')
+  expect(drawn).not.toContain('└')
+  await ui.unmount()
+})

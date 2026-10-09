@@ -1,6 +1,6 @@
 {
   "name": "repo-worktree",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A git dashboard: repos in the chat's folder are watched on their own, every other repo on the computer is listed to add. Worktrees, branches, ahead/behind, changes, pull/push/sync, refreshed every minute.",
   "author": {
     "name": "Yahya Shareef"
