@@ -1,8 +1,10 @@
-// Repo Worktree: watch the git repos you choose. Each repo is a card with a
-// row per worktree (its branch, ahead/behind its upstream, changed files)
-// and Pull, Push and Sync; the other local branches sit below. Fetched and
-// refreshed every minute. The watched list and whether the pane was open are
-// kept in the plugin's store, so they come back after a restart.
+// Repo Worktree: a git dashboard. The repos in the chat's folder are watched
+// on their own; every other repo on this computer is listed to pick from.
+// Each repo is a card with a row per worktree (its branch, ahead/behind its
+// upstream, changed files) and Pull, Push and Sync; the other local branches
+// sit below. Fetched and refreshed every minute. The watched list, what was
+// unwatched, what was found and whether the pane was open are kept in the
+// plugin's store, so they come back after a restart.
 //
 // Claude Code 2.1.287+ function hooks.
 
@@ -12,17 +14,39 @@ const DOUBLE_PRESS_MS = 450;
 const MAX_FILES = 50;
 const STORE_REPOS = "repos";
 const STORE_OPEN = "paneOpen";
+const STORE_DISMISSED = "dismissed";
+const STORE_FOUND = "discovered";
+const RESCAN_MS = 24 * 60 * 60_000;
+const SCAN_DEPTH = 4;
+const SCAN_BUDGET = 3000;
+const FOUND_SHOWN = 8;
+
+// Folders a repo is never under, or too big to walk for nothing.
+const SKIP_DIRS = new Set([
+  "node_modules", "appdata", "library", "applications", "program files", "program files (x86)", "windows",
+  "programdata", "$recycle.bin", "system volume information", "vendor", "dist", "build", "target", "out",
+  "venv", "env", "__pycache__", "site-packages", "pictures", "music", "videos", "movies", "snap",
+]);
 
 // `repos` is the watched list (main worktree roots), in the order added;
-// `data` what git last said about each; the rest is the pane's own.
+// `dismissed` repos the person unwatched, never added again on their own;
+// `data` what git last said about each; `found` the repos discovered on this
+// computer; the rest is the pane's own.
 const state = {
-  repos: [], data: {}, expanded: {}, messages: {}, busy: {},
+  repos: [], dismissed: [], data: {}, expanded: {}, messages: {}, busy: {},
   lastPress: {}, isOpen: false, isLoaded: false, isRefreshing: false, refreshedAt: 0, addError: "",
+  found: [], foundAt: 0, isScanning: false, query: "", showAllFound: false,
 };
 
 // ── git ───────────────────────────────────────────────────────────────────
 
-const norm = (p) => String(p ?? "").trim().replace(/^"|"$/g, "").replace(/\\/g, "/").replace(/\/+$/, "");
+// Forward slashes, no trailing slash, but a drive's root keeps its own ("C:/":
+// "C:" alone would be that drive's current folder).
+const norm = (p) => {
+  const s = String(p ?? "").trim().replace(/^"|"$/g, "").replace(/\\/g, "/").replace(/\/+$/, "");
+  return /^[A-Za-z]:$/.test(s) ? `${s}/` : s;
+};
+const join = (dir, name) => (dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`);
 const baseName = (p) => norm(p).split("/").pop() || norm(p);
 const isWindowsPath = (p) => /^[A-Za-z]:\//.test(norm(p));
 const samePath = (a, b) => (isWindowsPath(a) ? norm(a).toLowerCase() === norm(b).toLowerCase() : norm(a) === norm(b));
@@ -141,10 +165,118 @@ async function fetchRepo($, root) {
   return r.ok ? "" : r.err.split(/\r?\n/).pop();
 }
 
+// ── Finding repos ─────────────────────────────────────────────────────────
+
+const pathKey = (p) => (isWindowsPath(p) ? norm(p).toLowerCase() : norm(p));
+const isWatched = (root) => state.repos.some((r) => samePath(r, root));
+const isDismissed = (root) => state.dismissed.some((r) => samePath(r, root));
+
+// Folders holding a `.git`, breadth first from `bases`, `depth` levels down,
+// at most `budget` folders listed. A repo is not walked into. `.git` is a
+// folder in a repo's main checkout and a file in a worktree or submodule.
+async function findRepos($, bases, { depth = SCAN_DEPTH, budget = SCAN_BUDGET } = {}) {
+  const found = [];
+  const queue = bases.map((p) => ({ path: norm(p), level: 0 }));
+  const seen = new Set();
+  let listed = 0;
+  while (queue.length && listed < budget) {
+    const { path, level } = queue.shift();
+    if (seen.has(pathKey(path))) continue;
+    seen.add(pathKey(path));
+    let entries;
+    try { entries = await $.fs.list(path); } catch { continue; }
+    listed++;
+    const dotGit = entries.find((en) => en.name === ".git");
+    if (dotGit) { found.push({ path, mtimeMs: dotGit.mtimeMs || 0, isMain: dotGit.kind === "dir" }); continue; }
+    if (level >= depth) continue;
+    for (const en of entries) {
+      const name = en.name.toLowerCase();
+      if (en.kind !== "dir" || en.isLink || name.startsWith(".") || SKIP_DIRS.has(name)) continue;
+      queue.push({ path: join(path, en.name), level: level + 1 });
+    }
+  }
+  return found;
+}
+
+async function homeDir($) {
+  return norm((await $.env.get("USERPROFILE")) || (await $.env.get("HOME")) || "");
+}
+
+// Watches the repo `base` is in and every repo below it. On its own (the
+// chat's folder at start) a repo the person unwatched stays unwatched; asked
+// for (Watch this folder, /watch) it comes back.
+async function watchFolder($, base, { isManual = false } = {}) {
+  const roots = [];
+  const here = await resolveRepo($, base);
+  if (!here.error) roots.push(here.root);
+  for (const hit of await findRepos($, [base], { budget: 1500 })) {
+    const r = await resolveRepo($, hit.path);
+    if (!r.error) roots.push(r.root);
+  }
+  const added = [];
+  for (const root of roots) {
+    if (isWatched(root) || added.some((a) => samePath(a, root))) continue;
+    if (isDismissed(root) && !isManual) continue;
+    if (isManual) state.dismissed = state.dismissed.filter((d) => !samePath(d, root));
+    state.repos.push(root);
+    added.push(root);
+  }
+  if (added.length) {
+    await save($);
+    $.ui.invalidate("ui.render");
+    await Promise.all(added.map((root) => refreshRepo($, root)));
+  }
+  return { added, found: roots.length };
+}
+
+// Every repo on this computer worth offering: folders Claude Code has worked
+// in (~/.claude.json) first, then a walk of the home folder and the other
+// drives. Kept in the store and walked again once a day or on Rescan.
+async function discover($, { force = false } = {}) {
+  if (state.isScanning) return;
+  if (!force && state.foundAt && Date.now() - state.foundAt < RESCAN_MS) return;
+  state.isScanning = true;
+  $.ui.invalidate("ui.render");
+  try {
+    const home = await homeDir($);
+    const recent = [];
+    try {
+      const config = JSON.parse(await $.fs.read(join(home, ".claude.json")));
+      for (const p of Object.keys(config.projects ?? {})) {
+        try {
+          const stat = await $.fs.stat(join(norm(p), ".git"));
+          if (stat.kind === "dir") recent.push({ path: norm(p), mtimeMs: stat.mtimeMs || 0, isRecent: true });
+        } catch { /* not a repo's root */ }
+      }
+    } catch { /* no config to read */ }
+    const bases = home ? [home] : [];
+    if (isWindowsPath(home)) {
+      for (const d of "DEFGHIJ") {
+        try { if (await $.fs.exists(`${d}:/`)) bases.push(`${d}:/`); } catch { /* no such drive */ }
+      }
+    }
+    const scanned = (await findRepos($, bases)).filter((r) => r.isMain);
+    const byKey = new Map();
+    for (const r of [...recent, ...scanned]) if (!byKey.has(pathKey(r.path))) byKey.set(pathKey(r.path), r);
+    state.found = [...byKey.values()]
+      .sort((a, b) => Number(!!b.isRecent) - Number(!!a.isRecent) || b.mtimeMs - a.mtimeMs)
+      .map(({ path, isRecent }) => ({ path, isRecent: !!isRecent }));
+    state.foundAt = Date.now();
+    try { await $.store.set(STORE_FOUND, { at: state.foundAt, repos: state.found }); } catch { /* best effort */ }
+  } catch { /* nothing found this time: offered again on Rescan */ } finally {
+    state.isScanning = false;
+    $.ui.invalidate("ui.render");
+  }
+}
+
 // ── Watching and refreshing ───────────────────────────────────────────────
 
 async function save($) {
-  try { await $.store.set(STORE_REPOS, state.repos); await $.store.set(STORE_OPEN, state.isOpen); } catch { /* best effort */ }
+  try {
+    await $.store.set(STORE_REPOS, state.repos);
+    await $.store.set(STORE_DISMISSED, state.dismissed);
+    await $.store.set(STORE_OPEN, state.isOpen);
+  } catch { /* best effort */ }
 }
 
 async function refreshRepo($, root, { fetch = true } = {}) {
@@ -171,19 +303,24 @@ async function addRepo($, input) {
   if (!path) return;
   const found = await resolveRepo($, path);
   if (found.error) { state.addError = found.error; $.ui.invalidate("ui.render"); return; }
-  if (state.repos.some((r) => samePath(r, found.root))) { state.addError = `Already watching ${baseName(found.root)}`; $.ui.invalidate("ui.render"); return; }
+  if (isWatched(found.root)) { state.addError = `Already watching ${baseName(found.root)}`; $.ui.invalidate("ui.render"); return; }
+  state.dismissed = state.dismissed.filter((d) => !samePath(d, found.root));
   state.repos.push(found.root);
   await save($);
   $.ui.invalidate("ui.render");
   await refreshRepo($, found.root);
 }
 
+// Unwatching is remembered, so the chat's folder doesn't add it back.
 async function removeRepo($, root) {
   state.repos = state.repos.filter((r) => r !== root);
+  if (!isDismissed(root)) state.dismissed.push(root);
   delete state.data[root];
   await save($);
   $.ui.invalidate("ui.render");
 }
+
+const looksLikePath = (s) => /[\\/]/.test(s) || /^[A-Za-z]:/.test(s) || s.startsWith("~");
 
 async function openPane($, focus) {
   state.isOpen = true;
@@ -396,23 +533,77 @@ function paneView($, e) {
     Button({ key: "refresh", label: state.isRefreshing ? "Refreshing…" : "Refresh", variant: "secondary", dimColor: state.isRefreshing, onPress: () => refreshAll($) }),
   ] });
 
-  const add = Box({ key: "add", flexDirection: "column", paddingX: 1, children: [
-    Box({ key: "add-row", flexDirection: "row", gap: 1, alignItems: "center", children: [
-      Input
-        ? Box({ key: "field", flexGrow: 1, children: [Input({ key: "path", placeholder: "Paste a repo or worktree folder to watch", submitLabel: "Watch", onSubmit: (value) => addRepo($, value) })] })
-        : Text({ key: "hint", dimColor: true, children: "/watch <path> adds a repo" }),
-      Button({ key: "add-here", label: "Watch this folder", variant: "secondary", onPress: async () => addRepo($, await $.session.cwd()) }),
-    ] }),
-    state.addError ? Text({ key: "add-error", color: "error", children: state.addError }) : null,
-  ].filter(Boolean) });
-
   const body = state.repos.length
     ? state.repos.map((root) => repoCard(ui, $, root))
-    : [Text({ key: "empty", dimColor: true, children: "No repos yet. Paste a folder above, press Watch this folder, or run /watch <path>." })];
+    : [Text({ key: "empty", dimColor: true, children: "No repos in this folder. Pick some below, or paste a folder's path." })];
 
   return Box({ flexDirection: "column", gap: 1, padding: 1, children: [
-    header, add, ...body,
+    header, ...body,
     state.repos.length ? Text({ key: "tip", dimColor: true, children: "Double-click a repo's name to open it in VS Code. Click a branch to list its changes." }) : null,
+    addSection(ui, $),
+  ].filter(Boolean) });
+}
+
+// The repos on this computer not yet watched: searchable, a Watch button
+// each. The field takes a pasted path too.
+function addSection(ui, $) {
+  const { Box, Text, Button, Input } = ui;
+  const q = state.query.trim().toLowerCase();
+  const candidates = state.found.filter((f) => !isWatched(f.path));
+  const matches = q && !looksLikePath(q)
+    ? candidates.filter((f) => baseName(f.path).toLowerCase().includes(q) || f.path.toLowerCase().includes(q))
+    : candidates;
+  const shown = state.showAllFound || q ? matches.slice(0, 100) : matches.slice(0, FOUND_SHOWN);
+  const status = state.isScanning
+    ? "Looking for repos on this computer…"
+    : state.foundAt ? `${plural(candidates.length, "more repo")} on this computer` : "";
+
+  const rows = shown.map((f) => Box({
+    key: `found:${f.path}`, flexDirection: "row", alignItems: "center", gap: 1, paddingX: 1,
+    borderStyle: "round", borderColor: CHIP_BORDER,
+    children: [
+      Box({ key: "names", flexDirection: "row", gap: 1, flexGrow: 1, flexShrink: 1, alignItems: "center", children: [
+        Text({ key: "name", bold: true, children: baseName(f.path) }),
+        f.isRecent ? Text({ key: "recent", color: "suggestion", dimColor: true, children: "used with Claude" }) : null,
+        Text({ key: "path", dimColor: true, wrap: "truncate-start", children: f.path }),
+      ].filter(Boolean) }),
+      Button({ key: `watch:${f.path}`, label: "Watch", variant: "secondary", onPress: () => addRepo($, f.path) }),
+    ],
+  }));
+
+  return Box({ key: "add", flexDirection: "column", gap: 1, children: [
+    Box({ key: "add-head", flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingX: 1, children: [
+      Box({ key: "add-title", flexDirection: "column", children: [
+        Text({ key: "label", bold: true, children: "Add more" }),
+        status ? Text({ key: "status", dimColor: true, children: status }) : null,
+      ].filter(Boolean) }),
+      Box({ key: "add-tools", flexDirection: "row", gap: 1, children: [
+        Button({ key: "add-here", label: "Watch repos in this folder", variant: "secondary", onPress: async () => {
+          const { added, found } = await watchFolder($, await $.session.cwd(), { isManual: true });
+          state.addError = found ? (added.length ? "" : "Every repo in this folder is already watched") : "No repos in this folder";
+          $.ui.invalidate("ui.render");
+        } }),
+        Button({ key: "rescan", label: state.isScanning ? "Scanning…" : "Rescan", variant: "secondary", dimColor: state.isScanning, onPress: () => discover($, { force: true }) }),
+      ] }),
+    ] }),
+    Input
+      ? Box({ key: "field", paddingX: 1, children: [Input({
+          key: "search", placeholder: "Search repos, or paste a folder's path", submitLabel: "Watch",
+          onInput: (value) => { state.query = value; state.addError = ""; $.ui.invalidate("ui.render"); },
+          onSubmit: (value) => {
+            const v = value.trim();
+            if (looksLikePath(v)) return addRepo($, v);
+            if (matches[0]) return addRepo($, matches[0].path);
+          },
+        })] })
+      : Text({ key: "hint", dimColor: true, children: "/watch <path> adds a repo" }),
+    state.addError ? Text({ key: "add-error", color: "error", children: `  ${state.addError}` }) : null,
+    ...rows,
+    !q && matches.length > FOUND_SHOWN
+      ? Button({ key: "show-all", label: state.showAllFound ? "Show fewer" : `Show all ${matches.length}`, plain: true, dimColor: true,
+          onPress: () => { state.showAllFound = !state.showAllFound; $.ui.invalidate("ui.render"); } })
+      : null,
+    q && !looksLikePath(q) && !matches.length ? Text({ key: "none", dimColor: true, children: "  No repo by that name. Paste its folder's path instead." }) : null,
   ].filter(Boolean) });
 }
 
@@ -428,11 +619,21 @@ export function register(on) {
     try {
       const saved = await $.store.get(STORE_REPOS);
       state.repos = Array.isArray(saved) ? saved.map(norm) : [];
+      const dismissed = await $.store.get(STORE_DISMISSED);
+      state.dismissed = Array.isArray(dismissed) ? dismissed.map(norm) : [];
       state.isOpen = (await $.store.get(STORE_OPEN)) === true;
+      const found = await $.store.get(STORE_FOUND);
+      if (found && Array.isArray(found.repos)) { state.found = found.repos; state.foundAt = Number(found.at) || 0; }
     } catch { /* start empty */ }
     state.isLoaded = true;
     if (state.isOpen) { try { await openPane($, false); } catch { /* no room yet */ } }
-    void refreshAll($);
+    // The chat's folder first: its repos are watched on their own. Then the
+    // rest refresh, and the computer is searched for more when it's due.
+    void (async () => {
+      try { await watchFolder($, e.cwd); } catch { /* a folder we can't read */ }
+      try { await refreshAll($); } catch { /* shown per repo */ }
+      try { await discover($); } catch { /* offered again on Rescan */ }
+    })();
     stopTimer?.();
     const timer = $.clock.every(REFRESH_MS, () => { void refreshAll($); });
     stopTimer = () => timer.cancel();
@@ -441,17 +642,24 @@ export function register(on) {
 
   on("command.run", { command: "repos" }, async ($) => {
     await openPane($, true);
-    if (!state.repos.length) return { text: "Repos: nothing watched yet. Use /watch <path> or the pane's Watch box." };
     void refreshAll($);
+    void discover($);
     return { text: `Repos: ${plural(state.repos.length, "repo")} watched` };
   });
 
+  // `/watch` alone: every repo in the chat's folder; `/watch <path>`: that one.
   on("command.run", { command: "watch" }, async ($, e) => {
-    const path = e.args?.trim() || (await $.session.cwd());
-    await addRepo($, path);
-    if (state.addError) return { text: `Repos: ${state.addError}` };
+    const arg = e.args?.trim();
+    if (arg) {
+      await addRepo($, arg);
+      if (state.addError) return { text: `Repos: ${state.addError}` };
+      await openPane($, true);
+      return { text: `Repos: watching ${baseName(state.repos[state.repos.length - 1])}` };
+    }
+    const { added, found } = await watchFolder($, await $.session.cwd(), { isManual: true });
     await openPane($, true);
-    return { text: `Repos: watching ${baseName(state.repos[state.repos.length - 1])}` };
+    if (!found) return { text: "Repos: no repos in this folder" };
+    return { text: added.length ? `Repos: watching ${added.map(baseName).join(", ")}` : "Repos: every repo in this folder is already watched" };
   });
 
   on("ui.render", { component: "Pane" }, ($, e, next) => {
