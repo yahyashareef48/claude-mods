@@ -520,14 +520,15 @@ function desktopView($, e, go) {
   const list = Box({ key: "rows", flexDirection: "column", gap: 1, children: chips });
 
   const stepGo = (d) => { const to = shown[pos + d]; if (to) go(to.i); };
+  // A matched pair, no key badges: the pane's wheel and the chips are the
+  // quick ways about; these two step in order.
   const nav = Box({ key: "nav", flexDirection: "row", gap: 1, alignItems: "center", flexShrink: 0, children: [
-    Button({ key: "prev", label: "‹ Previous", variant: "secondary", hotkey: "p", dimColor: pos <= 0, onPress: () => stepGo(-1) }),
-    Button({ key: "next", label: "Next ›", variant: "primary", hotkey: "n", autoFocus: true, dimColor: pos >= shown.length - 1, onPress: () => stepGo(1) }),
+    Button({ key: "prev", label: "Previous", variant: "secondary", dimColor: pos <= 0, onPress: () => stepGo(-1) }),
+    Button({ key: "next", label: "Next", variant: "secondary", dimColor: pos >= shown.length - 1, onPress: () => stepGo(1) }),
   ] });
 
   const c = countChanges(step.diff);
   const meta = [
-    `${pos + 1} of ${shown.length}`,
     kindLabel(step),
     step.kind === "edit" || step.kind === "read" ? dirName(step.file) : "",
     step.ms >= 1000 ? duration(step.ms) : "",
@@ -535,7 +536,13 @@ function desktopView($, e, go) {
   const card = Box({
     key: "card", flexDirection: "column", gap: 1, padding: 1, borderStyle: "round", borderColor: "subtle",
     children: [
-      Box({ key: "card-head", flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", gap: 2, children: [
+      // The buttons have a row of their own, so a long title never pushes
+      // them out of the card.
+      Box({ key: "card-top", flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 2, children: [
+        Text({ key: "pos", dimColor: true, children: `Step ${pos + 1} of ${shown.length}` }),
+        nav,
+      ] }),
+      Box({ key: "card-head", flexDirection: "row", children: [
         Box({ key: "who", flexDirection: "row", gap: 1, alignItems: "flex-start", flexShrink: 1, children: [
           Svg({ key: "icon", source: symbol(glyphOf(step), step.isError ? RED : ACCENT_HEX, 20), alt: kindLabel(step), width: 20, height: 20 }),
           Box({ key: "names", flexDirection: "column", flexShrink: 1, children: [
@@ -548,7 +555,6 @@ function desktopView($, e, go) {
             ].filter(Boolean) }),
           ] }),
         ] }),
-        nav,
       ] }),
       ...bodyOf(ui, $, step),
     ],
