@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 const paneProps = { title: 'Repos', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 80 }, view: {} } as any
 
-type Git = { calls: string[][]; store: Record<string, unknown>; opened: number; behind?: number; ahead?: number; pullFails?: boolean }
+type Git = { calls: string[][]; store: Record<string, unknown>; opened: number; behind?: number; ahead?: number; pullFails?: boolean; pruneFails?: boolean; envs?: any[] }
 
 const dir = (name: string, mtimeMs = 0) => ({ name, kind: 'dir', size: 0, mtimeMs, isLink: false })
 const file = (name: string) => ({ name, kind: 'file', size: 1, mtimeMs: 0, isLink: false })
@@ -42,6 +42,7 @@ function stubEngine(on: any, g: Git) {
   on('process.run' as any, (_: any, e: any) => {
     const argv: string[] = [...e.argv]
     g.calls.push(argv)
+    g.envs?.push(e.init?.env)
     const cwd: string = e.init?.cwd ?? '/proj'
     const out = (stdout: string, exitCode = 0, stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[0] !== 'git') return out('')
@@ -60,6 +61,7 @@ function stubEngine(on: any, g: Git) {
     if (cmd === 'diff --numstat HEAD') return out(cwd === '/proj' ? '3\t1\tsrc/app.js\n' : '')
     if (cmd.startsWith('for-each-ref')) return out(repo === '/proj' ? 'main\torigin/main\tbehind 2\nfeature\t\t\nold\torigin/old\tgone\n' : 'main\t\t\n')
     if (cmd === 'pull --ff-only') return g.pullFails ? out('', 128, 'fatal: Not possible to fast-forward, aborting.') : out('Updating abc..123\n')
+    if (cmd === 'fetch --all --prune --quiet' && g.pruneFails) return out('', 1, "error: could not delete references: cannot lock ref 'refs/remotes/origin/x\"y': Invalid argument")
     if (cmd === 'remote') return out('origin\n')
     return out('')
   })
@@ -82,18 +84,36 @@ test('the repos in the chat\'s folder are watched on their own, and the pane sho
   expect(r.text).toContain('already watched')
   const ui = await mount($)
   const drawn = JSON.stringify(await ui.drawn())
-  expect(drawn).toContain('### Repos')
-  expect(drawn).toContain('▸ main')
-  expect(drawn).toContain('↓2 behind')
-  expect(drawn).toContain('2 changes')
-  expect(drawn).toContain('worktree · .wt/feature')
-  expect(drawn).toContain('upstream gone')
-  await ui.press({ key: 'branch:/proj' })
+  // The repo row: the branch pill, behind count, changes, and the one
+  // action that fits (behind, nothing ahead: Pull).
+  expect(drawn).toContain('⎇ main')
+  expect(drawn).toContain('↓2')
+  expect(drawn).toContain('● 2')
+  expect(drawn).toContain('"pull:/proj"')
+  expect(drawn).toContain('1 worktree')
+  // The worktree, nested, with no upstream: Publish.
+  expect(drawn).toContain('⎇ feature')
+  expect(drawn).toContain('"push:/proj/.wt/feature"')
+  expect(drawn).toContain('Publish')
+  // Clutter that is gone.
+  expect(drawn).not.toContain('Other branches')
+  expect(drawn).not.toContain('main worktree')
+  expect(drawn).not.toContain('src/app.js')
+  await ui.press({ key: 'files:/proj' })
   expect(JSON.stringify(await ui.drawn())).toContain('src/app.js')
   await ui.unmount()
 })
 
-test('every other repo on the computer is offered, searchable, and Watch adds it', { timeoutMs: 20_000 }, async ($, on) => {
+test('git runs with long paths on and never prompts', { timeoutMs: 20_000 }, async ($, on) => {
+  const g: Git = { calls: [], store: { discovered: { at: Date.now(), repos: [] } }, opened: 0, envs: [] }
+  stubEngine(on, g)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true } as any)
+  await settle(() => ran(g, 'fetch'))
+  expect(g.envs!.length > 0).toBe(true)
+  expect(g.envs![0]).toMatchObject({ GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_KEY_0: 'core.longpaths', GIT_CONFIG_VALUE_0: 'true' })
+})
+
+test('every other repo on the computer is offered in one menu, and picking one watches it', { timeoutMs: 20_000 }, async ($, on) => {
   const g: Git = { calls: [], store: {}, opened: 0 }
   stubEngine(on, g)
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true } as any)
@@ -103,18 +123,18 @@ test('every other repo on the computer is offered, searchable, and Watch adds it
   expect(found(g)!.at(-1)).toBe('/home/me/Projects/alpha')
   await run($, 'repos')
   const ui = await mount($)
-  const drawn = JSON.stringify(await ui.drawn())
-  expect(drawn).toContain('2 more repos on this computer')
-  expect(drawn).toContain('watch:/home/me/Projects/alpha')
-  expect(drawn).toContain('watch:/home/me/Projects/beta')
-  expect(drawn).toContain('used with Claude')
+  const tree: any = await ui.drawn()
+  const findKey = (n: any, key: string): any => n?.props?.key === key ? n : (n?.children ?? []).map((c: any) => findKey(c, key)).find(Boolean)
+  const menu = findKey(tree, 'add')
+  expect(menu.type).toBe('Select')
+  const values = menu.props.options.map((o: any) => o.value)
+  expect(values).toEqual(['', '/home/me/Projects/beta', '/home/me/Projects/alpha', '__rescan__'])
+  expect(menu.props.options[0].label).toBe('Add repo (2)')
+  expect(menu.props.options[2].label).toBe('alpha  ·  Projects')
+  const drawn = JSON.stringify(tree)
   expect(drawn).not.toContain('hidden-repo')
-  expect(drawn).not.toContain('"watch:/proj"')
-  await ui.input({ key: 'search', text: 'alp', kind: 'change' } as any)
-  const searched = JSON.stringify(await ui.drawn())
-  expect(searched).toContain('watch:/home/me/Projects/alpha')
-  expect(searched).not.toContain('watch:/home/me/Projects/beta')
-  await ui.press({ key: 'watch:/home/me/Projects/alpha' })
+  expect(drawn).not.toContain('Watch repos in this folder')
+  await ui.select({ key: 'add', value: '/home/me/Projects/alpha' } as any)
   await settle(() => (g.store.repos as string[]).length === 2)
   expect(g.store.repos).toEqual(['/proj', '/home/me/Projects/alpha'])
   expect(JSON.stringify(await ui.drawn())).toContain('"alpha"')
@@ -189,4 +209,16 @@ test('a folder outside any repo is refused with a reason', { timeoutMs: 20_000 }
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true } as any)
   const r: any = await run($, 'watch', '/tmp/nothing')
   expect(r.text).toContain('Not a git repository: /tmp/nothing')
+})
+
+test('a prune the file system refuses falls back to a plain fetch, with no error shown', { timeoutMs: 20_000 }, async ($, on) => {
+  const g: Git = { calls: [], store: { repos: ['/proj'], discovered: { at: Date.now(), repos: [] } }, opened: 0, pruneFails: true }
+  stubEngine(on, g)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true } as any)
+  await run($, 'repos')
+  const ui = await mount($)
+  await settle(() => ran(g, 'fetch --all --quiet'))
+  await new Promise((r) => setTimeout(r, 50))
+  expect(JSON.stringify(await ui.drawn())).not.toContain('Fetch failed')
+  await ui.unmount()
 })
