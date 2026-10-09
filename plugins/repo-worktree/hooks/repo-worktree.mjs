@@ -421,7 +421,7 @@ async function pressRepo($, root) {
 
 const GREEN = "#34c759", AMBER = "#ff9f0a", RED = "#ff453a", GRAY = "#8e8e93";
 const CHIP_BORDER = "rgba(142, 142, 147, 0.28)";
-const PILL_BORDER = "rgba(88, 166, 255, 0.45)";
+const PILL_BG = "rgba(88, 166, 255, 0.14)";
 const PILL_TEXT = "#58a6ff";
 const FILE_COLOR = { M: "warning", A: "success", D: "error", R: "suggestion", C: "suggestion", U: "error", T: "warning", "?": "subtle" };
 
@@ -461,15 +461,18 @@ function worktreeRow(ui, $, repo, wt, isChild) {
   const changes = wt.files?.length ?? 0;
   const isOpen = !!state.expanded[wt.path];
   const action = primaryAction(wt);
-  const name = isChild ? baseName(wt.path) : repo.name;
+  // A worktree named after its repo (`WebApp-API-linkedin-spec-725`) drops the
+  // repo's name: it already sits in that repo's card.
+  const own = baseName(wt.path);
+  const name = !isChild ? repo.name
+    : own.toLowerCase().startsWith(`${repo.name.toLowerCase()}-`) ? own.slice(repo.name.length + 1) : own;
   const others = repo.worktrees.length - 1;
   const note = wt.error ? shortError(wt.error) : !isChild && repo.fetchError ? `Fetch failed: ${shortError(repo.fetchError)}` : "";
 
   const line = Box({ key: "line", flexDirection: "row", alignItems: "center", gap: 1, children: [
-    isChild ? Text({ key: "elbow", dimColor: true, children: "└" }) : null,
     Svg({ key: "dot", source: dot(statusColor(repo, { ...wt, isChild })), alt: "", width: 8, height: 8 }),
     isChild
-      ? Text({ key: "name", children: name })
+      ? Text({ key: "name", wrap: "truncate-end", children: name })
       : Button({ key: `open:${repo.root}`, label: name, plain: true, onPress: () => pressRepo($, repo.root) }),
     !isChild && others > 0 ? Text({ key: "count", dimColor: true, children: plural(others, "worktree") }) : null,
     Box({ key: "gap", flexGrow: 1 }),
@@ -477,9 +480,8 @@ function worktreeRow(ui, $, repo, wt, isChild) {
       onPress: () => { state.expanded[wt.path] = !isOpen; $.ui.invalidate("ui.render"); } }) : null,
     wt.behind ? Text({ key: "behind", color: "warning", bold: true, children: `↓${wt.behind}` }) : null,
     wt.ahead ? Text({ key: "ahead", color: "suggestion", bold: true, children: `↑${wt.ahead}` }) : null,
-    Box({ key: "pill", borderStyle: "round", borderColor: PILL_BORDER, paddingX: 1, flexShrink: 0, children: [
-      Text({ key: "branch", color: PILL_TEXT, wrap: "truncate-end", children: wt.branch ? `⎇ ${clip(wt.branch, 28)}` : "detached" }),
-    ] }),
+    // The branch as a pill: tinted text, no taller than the row.
+    Text({ key: "branch", color: PILL_TEXT, backgroundColor: PILL_BG, wrap: "truncate-end", children: ` ${wt.branch ? `⎇ ${clip(wt.branch, 28)}` : "detached"} ` }),
     action ? Button({ key: `${action.kind}:${wt.path}`, label: busy ? BUSY_LABEL[busy] : action.label, variant: "secondary", dimColor: !!busy,
       onPress: () => act($, repo.root, wt, action.kind) }) : null,
     // Unwatch shows while the pointer is on the row (the keyed "line").
@@ -488,9 +490,10 @@ function worktreeRow(ui, $, repo, wt, isChild) {
     ] }) : null,
   ].filter(Boolean) });
 
-  return Box({ key: `wt:${wt.path}`, flexDirection: "column", paddingLeft: isChild ? 1 : 0, children: [
+  // A worktree is a chip of its own inside its repo's card.
+  const chip = isChild ? { borderStyle: "round", borderColor: CHIP_BORDER, paddingX: 1, marginLeft: 2 } : {};
+  return Box({ key: `wt:${wt.path}`, flexDirection: "column", ...chip, children: [
     line,
-    !isChild ? Text({ key: "path", dimColor: true, wrap: "truncate-start", children: `   ${repo.root}` }) : null,
     note ? Text({ key: "note", color: "error", dimColor: true, wrap: "truncate-end", children: `   ${note}` }) : null,
     msg ? Text({ key: "msg", color: msg.isError ? "error" : undefined, dimColor: !msg.isError, wrap: "truncate-end", children: `   ${msg.text}` }) : null,
     isOpen && changes ? Box({ key: "files", flexDirection: "column", paddingLeft: 3, children: wt.files.slice(0, MAX_FILES).map((f, n) =>
@@ -511,7 +514,8 @@ function repoCard(ui, $, root) {
         repo.error && !repo.worktrees.length ? Text({ key: "error", color: "error", dimColor: true, children: `${baseName(root)}: ${shortError(repo.error)}` }) : null,
       ].filter(Boolean)
     : [Text({ key: "loading", dimColor: true, children: `${baseName(root)}  ·  loading…` })];
-  return Box({ key: `repo:${root}`, flexDirection: "column", paddingX: 1, borderStyle: "round", borderColor: CHIP_BORDER, children });
+  const hasChips = (repo?.worktrees.length ?? 0) > 1;
+  return Box({ key: `repo:${root}`, flexDirection: "column", gap: hasChips ? 1 : 0, paddingX: 1, paddingBottom: hasChips ? 1 : 0, borderStyle: "round", borderColor: CHIP_BORDER, children });
 }
 
 // The unwatched repos on this computer, as one menu; picking one watches it.
