@@ -4,13 +4,18 @@
     "name": "Yahya Shareef"
   },
   "metadata": {
-    "description": "Claude Code mods tuned for the Claude desktop app: a live replay of every step Claude takes."
+    "description": "Claude Code mods tuned for the Claude desktop app: a live replay of every step Claude takes, and a git dashboard for the repos you watch."
   },
   "plugins": [
     {
       "name": "replay-theater",
       "source": "./plugins/replay-theater",
       "description": "A live timeline of everything Claude does in a turn (commands, reads, searches, edits) with diffs and output, in a pane."
+    },
+    {
+      "name": "repo-worktree",
+      "source": "./plugins/repo-worktree",
+      "description": "Watch the git repos you choose: every worktree and branch, ahead/behind, changed files, and pull, push and sync, refreshed every minute."
     }
   ]
 }
