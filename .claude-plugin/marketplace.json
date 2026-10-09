@@ -1,0 +1,21 @@
+{
+  "name": "claude-mods",
+  "owner": {
+    "name": "Yahya Shareef"
+  },
+  "metadata": {
+    "description": "Claude Code mods tuned for the Claude desktop app: a live replay of every step Claude takes, and an IDE-style file tree."
+  },
+  "plugins": [
+    {
+      "name": "replay-theater",
+      "source": "./plugins/replay-theater",
+      "description": "A live timeline of everything Claude does in a turn (commands, reads, searches, edits) with diffs and output, in a pane."
+    },
+    {
+      "name": "filetree",
+      "source": "./plugins/filetree",
+      "description": "An IDE-style file tree of the session folder with git status and live highlights on files Claude touches; opens in the desktop app too."
+    }
+  ]
+}
