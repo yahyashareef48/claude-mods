@@ -1,6 +1,6 @@
 {
   "name": "replay-theater",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Replay Theater: a live timeline of everything Claude does in a turn (commands, reads, searches, edits) with diffs and output.",
   "author": {
     "name": "Claude Code DevRel; desktop timeline by Yahya Shareef"
